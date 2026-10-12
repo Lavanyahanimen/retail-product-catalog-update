@@ -1,0 +1,804 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  catalog-delta-test-suite.xml
+  ──────────────────────────────────────────────────────────────────────────────
+  MUnit 3.3.1 tests for the catalog-deltaFlow sub-flow.
+
+  All tests use synthetic payloads.
+  No MySQL, no CSV file, and no CDN endpoint are required.
+
+  Tests
+  ─────
+  TC-01  Valid new product                → NEW
+  TC-02  Empty SKU                        → REJECTED
+  TC-03  Missing product name             → REJECTED
+  TC-04  Zero price                       → REJECTED
+  TC-05  Negative price                   → REJECTED
+  TC-06  Identical fields (existing)      → UNCHANGED
+  TC-07  Price change within threshold    → CHANGED (priceReviewRequired=false)
+  TC-08  Price change beyond threshold    → HOLD    (priceReviewRequired=true)
+  TC-09  Customer-facing field change     → CHANGED, customerFacingChange=true
+  TC-10  Internal-only taxClass change    → CHANGED, customerFacingChange=false
+  TC-11  Same fields → same content hash
+  TC-12  Different fields → different content hash
+  TC-13  New product: no DB connection needed (no mock for DB needed)
+-->
+
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+      xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+          http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/munit
+          http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+        http://www.mulesoft.org/schema/mule/munit-tools
+          http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd
+        http://www.mulesoft.org/schema/mule/ee/core
+          http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <munit:config name="catalog-delta-test-suite"/>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         Shared DataWeave: base valid product used across several tests
+    ════════════════════════════════════════════════════════════════════════ -->
+
+    <!-- TC-01 : Valid new product → classification = NEW ──────────────────── -->
+    <munit:test name="TC-01-valid-new-product-returns-NEW"
+                description="A fully valid product with no existing record is classified as NEW">
+
+        <munit:execution>
+            <ee:transform doc:name="Set valid new product payload">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-001",
+    productName   : "Wireless Headphones",
+    categoryCode  : "ELEC-AUDIO",
+    brand         : "SoundMax",
+    price         : 2499.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    shortDescription: "Over-ear wireless headphones with noise cancellation",
+    imagePath     : "/img/products/sku-001.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <!-- No existing product in DB -->
+                    <ee:set-variable variableName="existingProduct"><![CDATA[%dw 2.0 output application/java --- null]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Invoke catalog-deltaFlow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload.classification]"
+                is="#[MunitTools::equalTo('NEW')]"
+                message="TC-01: classification should be NEW"/>
+            <munit-tools:assert-that
+                expression="#[payload.sku]"
+                is="#[MunitTools::equalTo('SKU-001')]"
+                message="TC-01: sku should be SKU-001"/>
+            <munit-tools:assert-that
+                expression="#[sizeOf(payload.validationErrors)]"
+                is="#[MunitTools::equalTo(0)]"
+                message="TC-01: no validation errors expected"/>
+            <munit-tools:assert-that
+                expression="#[payload.customerFacingChange]"
+                is="#[MunitTools::equalTo(true)]"
+                message="TC-01: new product is always customer-facing"/>
+            <munit-tools:assert-that
+                expression="#[payload.priceReviewRequired]"
+                is="#[MunitTools::equalTo(false)]"
+                message="TC-01: no price review for new product"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- TC-02 : Empty SKU → REJECTED ──────────────────────────────────────── -->
+    <munit:test name="TC-02-empty-sku-returns-REJECTED"
+                description="A product with an empty SKU is classified as REJECTED">
+
+        <munit:execution>
+            <ee:transform doc:name="Set product with empty SKU">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "",
+    productName   : "Wireless Headphones",
+    categoryCode  : "ELEC-AUDIO",
+    brand         : "SoundMax",
+    price         : 2499.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    imagePath     : "/img/products/sku-001.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[%dw 2.0 output application/java --- null]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Invoke catalog-deltaFlow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload.classification]"
+                is="#[MunitTools::equalTo('REJECTED')]"
+                message="TC-02: empty SKU must be REJECTED"/>
+            <munit-tools:assert-that
+                expression="#[sizeOf(payload.validationErrors) > 0]"
+                is="#[MunitTools::equalTo(true)]"
+                message="TC-02: must have at least one validation error"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- TC-03 : Missing product name → REJECTED ───────────────────────────── -->
+    <munit:test name="TC-03-missing-product-name-returns-REJECTED"
+                description="A product with no productName is classified as REJECTED">
+
+        <munit:execution>
+            <ee:transform doc:name="Set product with missing name">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-002",
+    productName   : "",
+    categoryCode  : "ELEC-AUDIO",
+    brand         : "SoundMax",
+    price         : 999.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    imagePath     : "/img/products/sku-002.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[%dw 2.0 output application/java --- null]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Invoke catalog-deltaFlow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload.classification]"
+                is="#[MunitTools::equalTo('REJECTED')]"
+                message="TC-03: missing productName must be REJECTED"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- TC-04 : Zero price → REJECTED ─────────────────────────────────────── -->
+    <munit:test name="TC-04-zero-price-returns-REJECTED"
+                description="A product with price = 0 is classified as REJECTED">
+
+        <munit:execution>
+            <ee:transform doc:name="Set product with zero price">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-003",
+    productName   : "Budget Earbuds",
+    categoryCode  : "ELEC-AUDIO",
+    brand         : "SoundMax",
+    price         : 0,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    imagePath     : "/img/products/sku-003.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[%dw 2.0 output application/java --- null]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Invoke catalog-deltaFlow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload.classification]"
+                is="#[MunitTools::equalTo('REJECTED')]"
+                message="TC-04: zero price must be REJECTED"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- TC-05 : Negative price → REJECTED ─────────────────────────────────── -->
+    <munit:test name="TC-05-negative-price-returns-REJECTED"
+                description="A product with a negative price is classified as REJECTED">
+
+        <munit:execution>
+            <ee:transform doc:name="Set product with negative price">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-004",
+    productName   : "Test Product",
+    categoryCode  : "ELEC",
+    brand         : "TestBrand",
+    price         : -100,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    imagePath     : "/img/products/sku-004.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[%dw 2.0 output application/java --- null]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Invoke catalog-deltaFlow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload.classification]"
+                is="#[MunitTools::equalTo('REJECTED')]"
+                message="TC-05: negative price must be REJECTED"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- TC-06 : Identical fields → UNCHANGED ──────────────────────────────── -->
+    <munit:test name="TC-06-identical-fields-returns-UNCHANGED"
+                description="A product whose fields exactly match the existing record is UNCHANGED">
+
+        <munit:execution>
+            <ee:transform doc:name="Set identical incoming and existing product">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-010",
+    productName   : "USB-C Hub",
+    categoryCode  : "ELEC-ACC",
+    brand         : "ConnectPro",
+    price         : 1299.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    shortDescription: "7-in-1 USB-C hub",
+    imagePath     : "/img/products/sku-010.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <!-- Existing DB record has the same values -->
+                    <ee:set-variable variableName="existingProduct"><![CDATA[
+%dw 2.0
+output application/java
+---
+{
+    sku              : "SKU-010",
+    productName      : "USB-C Hub",
+    categoryCode     : "ELEC-ACC",
+    brand            : "ConnectPro",
+    price            : 1299.00,
+    currency         : "INR",
+    taxClass         : "GST-18",
+    stockStatus      : "IN_STOCK",
+    productStatus    : "ACTIVE",
+    shortDescription : "7-in-1 USB-C hub",
+    imagePath        : "/img/products/sku-010.jpg"
+}
+                    ]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Invoke catalog-deltaFlow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload.classification]"
+                is="#[MunitTools::equalTo('UNCHANGED')]"
+                message="TC-06: identical fields must be UNCHANGED"/>
+            <munit-tools:assert-that
+                expression="#[sizeOf(payload.changedFields)]"
+                is="#[MunitTools::equalTo(0)]"
+                message="TC-06: changedFields must be empty"/>
+            <munit-tools:assert-that
+                expression="#[payload.customerFacingChange]"
+                is="#[MunitTools::equalTo(false)]"
+                message="TC-06: no customer-facing change expected"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- TC-07 : Price change within 30 % → CHANGED, priceReviewRequired=false -->
+    <munit:test name="TC-07-price-change-within-threshold-returns-CHANGED"
+                description="A price change within 30% is CHANGED without triggering review">
+
+        <munit:execution>
+            <ee:transform doc:name="Set product with small price increase">
+                <ee:message>
+                    <!-- New price: 1400 (existing: 1299). Change = 7.8 % — under threshold -->
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-010",
+    productName   : "USB-C Hub",
+    categoryCode  : "ELEC-ACC",
+    brand         : "ConnectPro",
+    price         : 1400.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    shortDescription: "7-in-1 USB-C hub",
+    imagePath     : "/img/products/sku-010.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[
+%dw 2.0
+output application/java
+---
+{
+    sku              : "SKU-010",
+    productName      : "USB-C Hub",
+    categoryCode     : "ELEC-ACC",
+    brand            : "ConnectPro",
+    price            : 1299.00,
+    currency         : "INR",
+    taxClass         : "GST-18",
+    stockStatus      : "IN_STOCK",
+    productStatus    : "ACTIVE",
+    shortDescription : "7-in-1 USB-C hub",
+    imagePath        : "/img/products/sku-010.jpg"
+}
+                    ]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Invoke catalog-deltaFlow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload.classification]"
+                is="#[MunitTools::equalTo('CHANGED')]"
+                message="TC-07: within-threshold price change should be CHANGED"/>
+            <munit-tools:assert-that
+                expression="#[payload.priceReviewRequired]"
+                is="#[MunitTools::equalTo(false)]"
+                message="TC-07: priceReviewRequired must be false within threshold"/>
+            <munit-tools:assert-that
+                expression="#[payload.customerFacingChange]"
+                is="#[MunitTools::equalTo(true)]"
+                message="TC-07: price is a customer-facing field"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- TC-08 : Price change > 30 % → HOLD, priceReviewRequired=true ──────── -->
+    <munit:test name="TC-08-price-change-beyond-threshold-returns-HOLD"
+                description="A price change exceeding 30% triggers HOLD and priceReviewRequired=true">
+
+        <munit:execution>
+            <ee:transform doc:name="Set product with large price drop">
+                <ee:message>
+                    <!-- New price: 500 (existing: 1299). Change = -61.5 % — exceeds threshold -->
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-010",
+    productName   : "USB-C Hub",
+    categoryCode  : "ELEC-ACC",
+    brand         : "ConnectPro",
+    price         : 500.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    shortDescription: "7-in-1 USB-C hub",
+    imagePath     : "/img/products/sku-010.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[
+%dw 2.0
+output application/java
+---
+{
+    sku              : "SKU-010",
+    productName      : "USB-C Hub",
+    categoryCode     : "ELEC-ACC",
+    brand            : "ConnectPro",
+    price            : 1299.00,
+    currency         : "INR",
+    taxClass         : "GST-18",
+    stockStatus      : "IN_STOCK",
+    productStatus    : "ACTIVE",
+    shortDescription : "7-in-1 USB-C hub",
+    imagePath        : "/img/products/sku-010.jpg"
+}
+                    ]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Invoke catalog-deltaFlow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload.classification]"
+                is="#[MunitTools::equalTo('HOLD')]"
+                message="TC-08: price change > 30% must be HOLD"/>
+            <munit-tools:assert-that
+                expression="#[payload.priceReviewRequired]"
+                is="#[MunitTools::equalTo(true)]"
+                message="TC-08: priceReviewRequired must be true"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- TC-09 : Customer-facing field change → customerFacingChange = true ── -->
+    <munit:test name="TC-09-customer-facing-change-sets-flag-true"
+                description="Changing stockStatus (a customer-facing field) sets customerFacingChange=true">
+
+        <munit:execution>
+            <ee:transform doc:name="Set product with stockStatus change">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-020",
+    productName   : "Smart Watch",
+    categoryCode  : "WEARABLE",
+    brand         : "TimeTech",
+    price         : 4999.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "OUT_OF_STOCK",
+    productStatus : "ACTIVE",
+    imagePath     : "/img/products/sku-020.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[
+%dw 2.0
+output application/java
+---
+{
+    sku           : "SKU-020",
+    productName   : "Smart Watch",
+    categoryCode  : "WEARABLE",
+    brand         : "TimeTech",
+    price         : 4999.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    imagePath     : "/img/products/sku-020.jpg"
+}
+                    ]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Invoke catalog-deltaFlow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload.classification]"
+                is="#[MunitTools::equalTo('CHANGED')]"
+                message="TC-09: stockStatus change → CHANGED"/>
+            <munit-tools:assert-that
+                expression="#[payload.customerFacingChange]"
+                is="#[MunitTools::equalTo(true)]"
+                message="TC-09: stockStatus is customer-facing; flag must be true"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- TC-10 : Tax-class-only change → customerFacingChange = false ──────── -->
+    <munit:test name="TC-10-taxclass-only-change-does-not-set-customer-facing"
+                description="Changing only taxClass (internal field) must NOT set customerFacingChange=true">
+
+        <munit:execution>
+            <ee:transform doc:name="Set product with taxClass change only">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-030",
+    productName   : "Laptop Stand",
+    categoryCode  : "ELEC-ACC",
+    brand         : "ErgoDesk",
+    price         : 799.00,
+    currency      : "INR",
+    taxClass      : "GST-28",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    imagePath     : "/img/products/sku-030.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[
+%dw 2.0
+output application/java
+---
+{
+    sku           : "SKU-030",
+    productName   : "Laptop Stand",
+    categoryCode  : "ELEC-ACC",
+    brand         : "ErgoDesk",
+    price         : 799.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    imagePath     : "/img/products/sku-030.jpg"
+}
+                    ]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Invoke catalog-deltaFlow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload.classification]"
+                is="#[MunitTools::equalTo('CHANGED')]"
+                message="TC-10: taxClass changed → CHANGED"/>
+            <munit-tools:assert-that
+                expression="#[payload.customerFacingChange]"
+                is="#[MunitTools::equalTo(false)]"
+                message="TC-10: taxClass is internal-only; customerFacingChange must be false"/>
+            <munit-tools:assert-that
+                expression="#[payload.changedFields contains 'taxClass']"
+                is="#[MunitTools::equalTo(true)]"
+                message="TC-10: taxClass must appear in changedFields"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- TC-11 : Same fields → same content hash ────────────────────────────── -->
+    <munit:test name="TC-11-same-fields-produce-same-hash"
+                description="Two runs with identical fields must produce the same contentHash">
+
+        <!-- Run 1 -->
+        <munit:execution>
+            <ee:transform doc:name="Set product run 1">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-040",
+    productName   : "Bluetooth Speaker",
+    categoryCode  : "ELEC-AUDIO",
+    brand         : "BassMax",
+    price         : 1999.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    shortDescription: "Portable BT speaker, IPX5",
+    imagePath     : "/img/products/sku-040.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[%dw 2.0 output application/java --- null]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Run 1 of delta flow"/>
+
+            <!-- Capture hash from run 1 -->
+            <ee:transform doc:name="Capture hash from run 1">
+                <ee:variables>
+                    <ee:set-variable variableName="hashRun1"><![CDATA[%dw 2.0 output application/java --- payload.contentHash]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <!-- Run 2 with identical fields -->
+            <ee:transform doc:name="Set product run 2 (identical)">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-040",
+    productName   : "Bluetooth Speaker",
+    categoryCode  : "ELEC-AUDIO",
+    brand         : "BassMax",
+    price         : 1999.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    shortDescription: "Portable BT speaker, IPX5",
+    imagePath     : "/img/products/sku-040.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[%dw 2.0 output application/java --- null]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Run 2 of delta flow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload.contentHash]"
+                is="#[MunitTools::equalTo(vars.hashRun1)]"
+                message="TC-11: identical fields must produce the same contentHash"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- TC-12 : Different fields → different content hash ──────────────────── -->
+    <munit:test name="TC-12-different-fields-produce-different-hash"
+                description="Products with different prices must produce different contentHashes">
+
+        <munit:execution>
+            <!-- Product A -->
+            <ee:transform doc:name="Set product A">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-050",
+    productName   : "Mechanical Keyboard",
+    categoryCode  : "ELEC-INPUT",
+    brand         : "KeyForce",
+    price         : 3499.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    imagePath     : "/img/products/sku-050.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[%dw 2.0 output application/java --- null]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Run product A"/>
+
+            <ee:transform doc:name="Capture hash A">
+                <ee:variables>
+                    <ee:set-variable variableName="hashA"><![CDATA[%dw 2.0 output application/java --- payload.contentHash]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <!-- Product B — different price -->
+            <ee:transform doc:name="Set product B (different price)">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-050",
+    productName   : "Mechanical Keyboard",
+    categoryCode  : "ELEC-INPUT",
+    brand         : "KeyForce",
+    price         : 2999.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    imagePath     : "/img/products/sku-050.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[%dw 2.0 output application/java --- null]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Run product B"/>
+        </munit:execution>
+
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload.contentHash != vars.hashA]"
+                is="#[MunitTools::equalTo(true)]"
+                message="TC-12: different price must produce a different contentHash"/>
+        </munit:validation>
+    </munit:test>
+
+    <!-- TC-13 : New product requires no DB connection ───────────────────────── -->
+    <munit:test name="TC-13-new-product-needs-no-db-connection"
+                description="Processing a new product (existingProduct=null) succeeds without any DB mock">
+
+        <!-- No munit:mock-when is set — proves no DB call is made inside delta flow -->
+        <munit:execution>
+            <ee:transform doc:name="Set new product">
+                <ee:message>
+                    <ee:set-payload><![CDATA[
+%dw 2.0
+output application/json
+---
+{
+    sku           : "SKU-NEW-99",
+    productName   : "Gaming Mouse",
+    categoryCode  : "ELEC-INPUT",
+    brand         : "PixelGear",
+    price         : 2199.00,
+    currency      : "INR",
+    taxClass      : "GST-18",
+    stockStatus   : "IN_STOCK",
+    productStatus : "ACTIVE",
+    imagePath     : "/img/products/sku-new-99.jpg"
+}
+                    ]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="existingProduct"><![CDATA[%dw 2.0 output application/java --- null]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+
+            <flow-ref name="catalog-deltaFlow" doc:name="Invoke catalog-deltaFlow"/>
+        </munit:execution>
+
+        <munit:validation>
+            <!-- Flow must complete successfully and return NEW -->
+            <munit-tools:assert-that
+                expression="#[payload.classification]"
+                is="#[MunitTools::equalTo('NEW')]"
+                message="TC-13: new product must be classified NEW with no DB dependency"/>
+            <munit-tools:assert-that
+                expression="#[payload.contentHash != null]"
+                is="#[MunitTools::equalTo(true)]"
+                message="TC-13: contentHash must be present"/>
+        </munit:validation>
+    </munit:test>
+
+</mule>
