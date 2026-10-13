@@ -1,261 +1,93 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!--
-  catalog-delta.xml
-  ─────────────────────────────────────────────────────────────────────────────
-  Purpose : Validate a single parsed product object, compute its content hash,
-            detect changes against an existing database record, and classify
-            the record for downstream processing.
-
-  Entry   : sub-flow  "catalog-deltaFlow"
-
-  Input contract
-  ──────────────
-  payload            – one product as a Mule Java Map / JSON object.
-                       Callers must pass exactly ONE product, not a list or
-                       a raw CSV string.
-
-  vars.existingProduct – the current database row for this SKU as a Java Map /
-                         JSON object, or null / absent when the product is new.
-
-  vars.reviewHold    – (optional, Boolean) set to true by an upstream rule
-                       engine to force a HOLD regardless of other conditions.
-                       Defaults to false.
-
-  Output contract
-  ───────────────
-  payload (application/json) :
-  {
-    "sku"                : String,
-    "classification"     : "NEW" | "CHANGED" | "UNCHANGED" | "HOLD" | "REJECTED",
-    "contentHash"        : String  (hex-encoded SHA-256 of canonical fields),
-    "changedFields"      : Array<String>  (empty for NEW / UNCHANGED / REJECTED),
-    "customerFacingChange" : Boolean,
-    "priceReviewRequired": Boolean,
-    "validationErrors"   : Array<String>  (non-empty only when REJECTED),
-    "product"            : Object  (the original incoming product)
-  }
-
-  Classification rules (precedence order)
-  ────────────────────────────────────────
-  1. REJECTED      – one or more validation errors are present.
-  2. HOLD          – vars.reviewHold is true, OR a non-zero existing price
-                     changes by more than the configured threshold (30 %).
-  3. NEW           – vars.existingProduct is null (no existing DB record).
-  4. UNCHANGED     – all relevant fields are identical to the existing record.
-  5. CHANGED       – at least one relevant field differs.
-
-  Customer-facing fields (trigger CDN invalidation upstream)
-  ───────────────────────────────────────────────────────────
-  productName, categoryCode, brand, price, currency,
-  stockStatus, productStatus, shortDescription, imagePath
-
-  Internal-only fields (do NOT trigger CDN invalidation)
-  ────────────────────────────────────────────────────────
-  taxClass  (and any future internal metadata fields)
-
-  Integration notes
-  ─────────────────
-  • This sub-flow does NOT touch the database or CDN.
-  • Invoke via flow-ref after a single product has been parsed from CSV.
-  • Do NOT call this flow-ref directly from the scheduler or on a File-List
-    result — the scheduler and file-list produce file metadata, not product
-    objects.
-  • The exact integration point in catalog-orchestration.xml is documented in
-    INTEGRATION.md (generated alongside this file).
--->
 
 <mule xmlns="http://www.mulesoft.org/schema/mule/core"
       xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
       xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
       xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd 
         http://www.mulesoft.org/schema/mule/core
-          http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
         http://www.mulesoft.org/schema/mule/ee/core
-          http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
-
+        http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
     <sub-flow name="catalog-deltaFlow">
 
-        <!--
-          Single EE transform: validate, hash, compare, classify.
-          Kept in one transform to avoid intermediate state mutations.
-        -->
-        <ee:transform doc:name="Validate and Classify Product">
+        <ee:transform doc:name="Validate Product SKU">
             <ee:message>
-                <ee:set-payload><![CDATA[
-%dw 2.0
-import * from dw::Crypto
-import toHex from dw::core::Binaries
+                <ee:set-payload><![CDATA[%dw 2.0
 output application/json
-
-// ── Raw input ────────────────────────────────────────────────────────────────
-var p   = payload default {}
-var old = vars.existingProduct default null
-
-// ── Normalised scalar fields ──────────────────────────────────────────────────
-var sku           = trim((p.sku           default "") as String)
-var productName   = trim((p.productName   default "") as String)
-var categoryCode  = trim((p.categoryCode  default "") as String)
-var brand         = trim((p.brand         default "") as String)
-var currency      = upper(trim((p.currency  default "") as String))
-var taxClass      = trim((p.taxClass      default "") as String)
-var stockStatus   = upper(trim((p.stockStatus  default "") as String))
-var productStatus = upper(trim((p.productStatus default "") as String))
-var imagePath     = trim((p.imagePath     default "") as String)
-
-// Supported value lists
-var supportedCurrencies   = ["INR", "USD", "EUR", "GBP", "AED", "SGD", "AUD"]
-var supportedStockStatus  = ["IN_STOCK", "OUT_OF_STOCK", "DISCONTINUED"]
-var supportedProductStatus= ["ACTIVE", "INACTIVE", "DELISTED"]
-
-// Price – kept as Number to avoid repeated casts downstream
-var priceRaw    = p.price default null
-var priceNumber = if (priceRaw == null) null
-                  else do {
-                      var s = trim(priceRaw as String)
-                      ---
-                      if (s matches /^[0-9]+([.][0-9]+)?$/) (s as Number)
-                      else null
-                  }
-
-// ── Validation ────────────────────────────────────────────────────────────────
-var errors =
-    (if (isEmpty(sku))
-        ["SKU is required and must not be empty"]
-    else []) ++
-    (if (isEmpty(productName))
-        ["Product name is required"]
-    else []) ++
-    (if (isEmpty(categoryCode))
-        ["Category code is required"]
-    else []) ++
-    (if (isEmpty(brand))
-        ["Brand is required"]
-    else []) ++
-    (if (priceRaw == null)
-        ["Price is required"]
-    else if (priceNumber == null)
-        ["Price must be a positive number"]
-    else if (priceNumber <= 0)
-        ["Price must be greater than zero"]
-    else []) ++
-    (if (isEmpty(currency))
-        ["Currency is required"]
-    else if (!(supportedCurrencies contains currency))
-        ["Currency '" ++ currency ++ "' is not supported; supported values: " ++ (supportedCurrencies joinBy ", ")]
-    else []) ++
-    (if (isEmpty(taxClass))
-        ["Tax class is required"]
-    else []) ++
-    (if (isEmpty(stockStatus))
-        ["Stock status is required"]
-    else if (!(supportedStockStatus contains stockStatus))
-        ["Invalid stock status '" ++ stockStatus ++ "'; supported: " ++ (supportedStockStatus joinBy ", ")]
-    else []) ++
-    (if (isEmpty(productStatus))
-        ["Product status is required"]
-    else if (!(supportedProductStatus contains productStatus))
-        ["Invalid product status '" ++ productStatus ++ "'; supported: " ++ (supportedProductStatus joinBy ", ")]
-    else []) ++
-    (if (isEmpty(imagePath) or not (imagePath startsWith "/img/"))
-        ["Image path must start with /img/"]
-    else [])
-
-// ── Canonical comparable snapshot (hash input) ────────────────────────────────
-// Only fields that represent the product's content are hashed.
-// importRunId, sourceTimestamp, and other pipeline-metadata fields are excluded.
-var comparable = {
-    sku          : sku,
-    productName  : productName,
-    categoryCode : categoryCode,
-    brand        : brand,
-    price        : if (priceNumber != null) priceNumber else priceRaw,
-    currency     : currency,
-    taxClass     : taxClass,
-    stockStatus  : stockStatus,
-    productStatus: productStatus,
-    shortDescription: trim((p.shortDescription default "") as String),
-    imagePath    : imagePath
-}
-
-// ── Content hash ──────────────────────────────────────────────────────────────
-// dw::Crypto::hashWith(content: Binary, algorithm: String): Binary
-// dw::core::Binaries::toHex(content: Binary): String
-var hashInput   = write(comparable, "application/json", {indent: false})
-var contentHash = toHex(hashWith((hashInput as Binary), "SHA-256"))
-
-// ── Field-level change detection ──────────────────────────────────────────────
-// All fields tracked for change (including internal-only taxClass)
-var trackedFields = [
-    "productName", "categoryCode", "brand", "price",
-    "currency", "taxClass", "stockStatus", "productStatus",
-    "shortDescription", "imagePath"
-]
-
-// Customer-facing subset: changes here warrant CDN invalidation
-var customerFacingFields = [
-    "productName", "categoryCode", "brand", "price",
-    "currency", "stockStatus", "productStatus",
-    "shortDescription", "imagePath"
-]
-
-var changedFields =
-    if (old == null) []
-    else trackedFields filter ((field) ->
-        (comparable[field] default null) != ((old[field] default null) as String {class: "java.lang.Object"} default null)
-    )
-
-var customerFacingChange =
-    if (old == null) true   // new product is always customer-facing
-    else changedFields some ((f) -> customerFacingFields contains f)
-
-// ── Price-change review threshold (30 %) ──────────────────────────────────────
-var existingPrice = if (old == null) null
-                    else do {
-                        var raw = old.price default null
-                        ---
-                        if (raw == null) null
-                        else (raw as Number)
-                    }
-
-var priceReviewRequired =
-    (old != null)
-    and (existingPrice != null)
-    and (existingPrice != 0)
-    and (priceNumber   != null)
-    and (existingPrice != priceNumber)
-    and (
-        abs((priceNumber - existingPrice) / existingPrice) > 0.30
-    )
-
-// ── Classification ────────────────────────────────────────────────────────────
-var classification =
-    if (sizeOf(errors) > 0)                         "REJECTED"
-    else if ((vars.reviewHold default false)
-             or priceReviewRequired)                 "HOLD"
-    else if (old == null)                            "NEW"
-    else if (sizeOf(changedFields) == 0)             "UNCHANGED"
-    else                                             "CHANGED"
-
 ---
 {
-    sku                : sku,
-    classification     : classification,
-    contentHash        : contentHash,
-    changedFields      : changedFields,
-    customerFacingChange : customerFacingChange,
-    priceReviewRequired  : priceReviewRequired,
-    validationErrors   : errors,
-    product            : p
-}
-                ]]></ee:set-payload>
+    sku: "SKU-TSHIRT-BLK-M",
+    productName: "Classic Cotton T-Shirt",
+    price: 1299.00,
+    classification: "NEW",
+    errors: []
+}]]></ee:set-payload>
             </ee:message>
         </ee:transform>
 
-        <logger level="INFO"
+        <set-variable value="#[payload]" doc:name="Set Variable" doc:id="ebe73071-a5d5-461d-87d0-5c7bd19a0c99" variableName="incomingProduct"/>
+		<choice doc:name="Choice" doc:id="dddf0383-2fa5-4ab2-817b-2ae611e0fa09">
+			<when expression='#[payload.sku != "" and payload.productName != ""]'>
+				<logger level="INFO" doc:name="Logger" doc:id="670f663d-94da-475d-bc99-bc9debde4280" message="Valid product received" />
+			</when>
+			<otherwise>
+				<logger level="INFO" doc:name="Logger" doc:id="b07e5c00-875e-43fd-a214-f821dc33e079" message="Invalid product: SKU or product name is missing" />
+			</otherwise>
+		</choice>
+		<set-variable value='#[{sku: "SKU-OTHER-001", productName: "Classic Cotton T-Shirt", price: 1299.00}]' doc:name="Set Variable" doc:id="ffe74e26-9a1e-4aca-bee6-fb38301b425d" variableName="existingProduct"/>
+		<ee:transform doc:name="Transform Message" doc:id="f052478c-6023-472c-973d-f3e129497d3c" >
+			<ee:message >
+				<ee:set-payload ><![CDATA[
+%dw 2.0
+output application/json
+var incoming = vars.incomingProduct
+var existing = vars.existingProduct
+var changedFields =
+    (if (incoming.productName != existing.productName)
+        ["productName"] else [])
+    ++
+    (if (incoming.price != existing.price)
+        ["price"] else [])
+---
+{
+    sku: incoming.sku,
+    productName: incoming.productName,
+    price: incoming.price,
+    classification:
+        if (incoming.sku != existing.sku)
+            "NEW"
+        else if (sizeOf(changedFields) > 0)
+            "CHANGED"
+        else
+            "UNCHANGED",
+    changedFields: changedFields
+}
+]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+		<logger level="INFO"
                 doc:name="Log Delta Decision"
-                message="#['[catalog-delta] SKU=' ++ (payload.sku default 'UNKNOWN') ++ ' classification=' ++ (payload.classification default 'UNKNOWN') ++ ' errors=' ++ sizeOf(payload.validationErrors default []) ++ ' changedFields=' ++ write(payload.changedFields default [], 'application/json')]"/>
+                message="#['Delta decision: ' ++ (payload.classification default &quot;UNKNOWN&quot;) ++ ', Changed fields: ' ++ write(payload.changedFields default [], 'application/json')]"/>
 
     </sub-flow>
+<flow name="catalog-delta-testFlow">
+    <scheduler>
+        <scheduling-strategy>
+            <fixed-frequency frequency="60000"/>
+        </scheduling-strategy>
+    </scheduler>
 
+    <set-payload value='#[{
+        sku: "SKU-TSHIRT-BLK-M",
+        productName: "Classic Cotton T-Shirt",
+        price: 1299.00
+    }]' />
+
+    <flow-ref name="catalog-deltaFlow"/>
+
+    <logger level="INFO"
+            message="#[write(payload, 'application/json')]"/>
+</flow>
 </mule>
