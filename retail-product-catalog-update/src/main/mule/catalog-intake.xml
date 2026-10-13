@@ -1,34 +1,41 @@
 <?xml version="1.0" encoding="UTF-8"?>
 
-<mule xmlns:file="http://www.mulesoft.org/schema/mule/file"
+<mule xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
       xmlns="http://www.mulesoft.org/schema/mule/core"
       xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
       xsi:schemaLocation="
       http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
-      http://www.mulesoft.org/schema/mule/file http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd">
+      http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+      http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
 
-    <file:config name="File_Config">
-        <file:connection workingDir="C:\catalog-data"/>
-    </file:config>
+    <http:listener-config name="HTTP_Listener_config"
+                          doc:name="HTTP Listener config">
+        <http:listener-connection host="0.0.0.0" port="8081"/>
+    </http:listener-config>
 
-    <file:config name="File_Config1" doc:name="File Config" doc:id="032a02b0-8bdc-4d0a-a1f5-5b25879a51cc" >
-		<file:connection />
-	</file:config>
-	<flow name="catalog-intakeFlow">
-        <scheduler doc:name="Scheduler">
-            <scheduling-strategy>
-                <fixed-frequency frequency="10" timeUnit="SECONDS"/>
-            </scheduling-strategy>
-        </scheduler>
-
-       <file:list config-ref="File_Config1"
-           directoryPath="inbound"
-           doc:name="List incoming catalog files"/>
+    <flow name="catalog-orchestrationFlow">
+        <http:listener config-ref="HTTP_Listener_config"
+                       path="/catalog/process"
+                       allowedMethods="GET"
+                       doc:name="Catalog Listener"/>
 
         <logger level="INFO"
-                message="Catalog intake checked the inbound folder"
-                doc:name="Intake Logger"/>
+                message="Catalog processing started"
+                doc:name="Start Logger"/>
+
+        <ee:transform doc:name="Create Response">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    message: "Catalog processing endpoint is working",
+    status: "SUCCESS"
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
     </flow>
 
 </mule>
