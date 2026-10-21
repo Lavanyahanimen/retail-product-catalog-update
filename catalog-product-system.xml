@@ -1,0 +1,251 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <!-- Keep the existing global HTTP Listener configuration named HTTP_Listener_config
+         and the existing Database_Config global element in this Mule application. -->
+
+    <http:listener-config name="HTTP_Listener_config" doc:name="HTTP Listener config" doc:id="8ca0d766-d778-4888-a08c-d53c68310240" >
+		<http:listener-connection host="0.0.0.0" port="8081" />
+	</http:listener-config>
+	<db:config name="Database_Config" doc:name="Database Config" doc:id="be8dbd27-bbff-431a-812c-8b6f3bb5c7b0" >
+		<db:my-sql-connection host="localhost" port="3306" user="root" password="sai@2004" database="retail_catalog" />
+	</db:config>
+	<flow name="catalog-product-systemFlow">
+        <http:listener config-ref="HTTP_Listener_config"
+                       path="/products"
+                       allowedMethods="GET"
+                       doc:name="GET Product by SKU">
+            <http:response statusCode="#[vars.httpStatus default 200]">
+                <http:headers><![CDATA[#[output application/java
+---
+{
+  "Content-Type": "application/json"
+}]]]></http:headers>
+            </http:response>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+                <http:headers><![CDATA[#[output application/java
+---
+{
+  "Content-Type": "application/json"
+}]]]></http:headers>
+            </http:error-response>
+        </http:listener>
+
+        <choice doc:name="Validate GET SKU">
+            <when expression="#[isEmpty(attributes.queryParams.sku default '')]">
+                <set-variable variableName="httpStatus" value="#[400]" doc:name="Set 400 Status"/>
+                <ee:transform doc:name="Missing SKU Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ message: "Query parameter 'sku' is required" }]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <otherwise>
+                <db:select config-ref="Database_Config" doc:name="Find Product">
+                    <db:sql><![CDATA[SELECT * FROM products WHERE sku = :sku]]></db:sql>
+                    <db:input-parameters><![CDATA[#[{ sku: attributes.queryParams.sku }]]]></db:input-parameters>
+                </db:select>
+                <choice doc:name="Check Product">
+                    <when expression="#[!isEmpty(payload)]">
+                        <ee:transform doc:name="Return Product">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload[0]]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+                    </when>
+                    <otherwise>
+                        <set-variable variableName="httpStatus" value="#[404]" doc:name="Set 404 Status"/>
+                        <ee:transform doc:name="Product Not Found">
+                            <ee:message>
+                                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  message: "Product not found",
+  sku: attributes.queryParams.sku
+}]]></ee:set-payload>
+                            </ee:message>
+                        </ee:transform>
+                    </otherwise>
+                </choice>
+            </otherwise>
+        </choice>
+
+        <error-handler>
+            <on-error-continue type="ANY" logException="true" doc:name="Handle GET Error">
+                <set-variable variableName="httpStatus" value="#[500]" doc:name="Set 500 Status"/>
+                <ee:transform doc:name="GET Error Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ message: "Unable to retrieve product" }]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <flow name="create-product-flow">
+        <http:listener config-ref="HTTP_Listener_config"
+                       path="/products"
+                       allowedMethods="POST"
+                       doc:name="POST Create Product">
+            <http:response statusCode="#[vars.httpStatus default 201]">
+                <http:headers><![CDATA[#[output application/java
+---
+{
+  "Content-Type": "application/json"
+}]]]></http:headers>
+            </http:response>
+            <http:error-response statusCode="#[vars.httpStatus default 500]">
+                <http:body><![CDATA[#[payload]]]></http:body>
+                <http:headers><![CDATA[#[output application/java
+---
+{
+  "Content-Type": "application/json"
+}]]]></http:headers>
+            </http:error-response>
+        </http:listener>
+
+        <ee:transform doc:name="Normalize Request">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+// HTTP listener requests may arrive as JSON text (especially in MUnit HTTP tests).
+// Parse text explicitly; already-decoded objects are left unchanged.
+var p = if (payload is String) read(payload as String, "application/json") else payload
+---
+{
+  sku: (p.sku default "") as String,
+  product_name: (p.product_name default "") as String,
+  category_code: (p.category_code default "") as String,
+  brand: (p.brand default "") as String,
+  price: p.price default null,
+  currency: (p.currency default "") as String,
+  tax_class: (p.tax_class default "") as String,
+  stock_status: (p.stock_status default "") as String,
+  product_status: (p.product_status default "") as String,
+  short_description: p.short_description default null,
+  image_path: p.image_path default null,
+  content_hash: p.content_hash default null,
+  source_updated_at: p.source_updated_at default null,
+  last_run_id: p.last_run_id default null,
+  review_hold: p.review_hold default false
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <choice doc:name="Validate Required Fields">
+            <when expression="#[isEmpty(payload.sku) or isEmpty(payload.product_name) or isEmpty(payload.category_code) or isEmpty(payload.brand) or payload.price == null or isEmpty(payload.currency) or isEmpty(payload.tax_class) or isEmpty(payload.stock_status) or isEmpty(payload.product_status)]">
+                <set-variable variableName="httpStatus" value="#[400]" doc:name="Set 400 Status"/>
+                <ee:transform doc:name="Validation Error">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  message: "Required fields: sku, product_name, category_code, brand, price, currency, tax_class, stock_status, product_status"
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </when>
+            <otherwise>
+                <set-variable variableName="createdSku" value="#[payload.sku]" doc:name="Save Created SKU Before Insert"/>
+                <db:insert config-ref="Database_Config" doc:name="Insert Product">
+                    <db:sql><![CDATA[INSERT INTO products
+(sku, product_name, category_code, brand, price, currency, tax_class,
+ stock_status, product_status, short_description, image_path, content_hash,
+ source_updated_at, last_run_id, review_hold)
+VALUES
+(:sku, :product_name, :category_code, :brand, :price, :currency, :tax_class,
+ :stock_status, :product_status, :short_description, :image_path, :content_hash,
+ :source_updated_at, :last_run_id, :review_hold)]]></db:sql>
+                    <db:input-parameters><![CDATA[#[payload]]]></db:input-parameters>
+                </db:insert>
+                <set-variable variableName="httpStatus" value="#[201]" doc:name="Set 201 Status"/>
+                <ee:transform doc:name="Created Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  message: "Product created successfully",
+  sku: vars.createdSku
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </otherwise>
+        </choice>
+
+        <error-handler>
+            <on-error-continue type="DB:QUERY_EXECUTION" logException="true" doc:name="Handle Insert Database Error">
+                <set-variable variableName="httpStatus" value="#[409]" doc:name="Set 409 Status"/>
+                <ee:transform doc:name="Insert Conflict Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+  message: "Product could not be inserted. The SKU may already exist or a database constraint failed."
+}]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+            <on-error-continue type="ANY" logException="true" doc:name="Handle POST Error">
+                <set-variable variableName="httpStatus" value="#[500]" doc:name="Set 500 Status"/>
+                <ee:transform doc:name="POST Error Response">
+                    <ee:message>
+                        <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ message: "Unable to create product" }]]></ee:set-payload>
+                    </ee:message>
+                </ee:transform>
+            </on-error-continue>
+        </error-handler>
+    </flow>
+
+    <flow name="get-product-count-flow">
+        <http:listener config-ref="HTTP_Listener_config"
+                       path="/product-count"
+                       allowedMethods="GET"
+                       doc:name="GET Product Count">
+            <http:response statusCode="#[200]">
+                <http:headers><![CDATA[#[output application/java
+---
+{"Content-Type": "application/json"}]]]></http:headers>
+            </http:response>
+        </http:listener>
+        <db:select config-ref="Database_Config" doc:name="Count Products">
+            <db:sql><![CDATA[SELECT COUNT(*) AS product_count FROM products]]></db:sql>
+        </db:select>
+        <ee:transform doc:name="Format Product Count">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{ count: (payload[0].product_count default 0) as Number }]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+
+</mule>
+
