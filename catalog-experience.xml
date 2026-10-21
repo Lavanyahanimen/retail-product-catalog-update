@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:file="http://www.mulesoft.org/schema/mule/file"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/file
+        http://www.mulesoft.org/schema/mule/file/current/mule-file.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd">
+
+    <configuration-properties doc:name="Catalog Properties" file="catalog.properties"/>
+
+    <file:config name="Catalog_File_Config"
+                 doc:name="Catalog File Config">
+        <file:connection />
+    </file:config>
+
+    <flow name="catalog-experience-file-listener">
+
+        <file:listener
+            config-ref="Catalog_File_Config"
+            directory="${catalog.inbound.dir}"
+            outputMimeType="text/plain"
+            doc:name="Watch Inbound Catalog Files" moveToDirectory="${catalog.processing.dir}">
+
+            <scheduling-strategy>
+                <fixed-frequency
+                    frequency="10"
+                    timeUnit="SECONDS"/>
+            </scheduling-strategy>
+
+            <file:matcher filenamePattern="*.csv"/>
+
+        </file:listener>
+
+        <logger
+            level="INFO"
+            doc:name="Log Incoming File"
+            message="#['Received catalog file. Payload type: ' ++ (typeOf(payload) as String)]"/>
+
+        <flow-ref
+            name="process-catalog-file"
+            doc:name="Process Catalog File"/>
+
+        <error-handler>
+            <on-error-continue logException="true"
+                               doc:name="Handle Catalog File Error">
+                <logger
+                    level="ERROR"
+                    doc:name="Log Catalog File Error"
+                    message="#['Catalog file processing failed: ' ++ error.description]"/>
+            </on-error-continue>
+        </error-handler>
+
+    </flow>
+
+</mule>
+
+
+
+
+
+
+
+
+
+
+
+
