@@ -1,0 +1,290 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+      xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+        http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+
+    <db:config name="Database_Config1" doc:name="Database Config" doc:id="00185469-7024-4683-83bc-701cd968ce2d" >
+		<db:my-sql-connection host="localhost" port="3306" user="root" password="sai@2004" database="retail_catalog" />
+	</db:config>
+	<configuration doc:name="Configuration" doc:id="f677f181-b640-41f3-b095-ec5a6633fa1c" defaultErrorHandler-ref="Retail_Global_Error_Handler" />
+	<sub-flow name="process-catalog-file">
+        <set-variable variableName="runId" value="#[uuid()]" doc:name="Create Run ID"/>
+        <set-variable variableName="catalogFileName" value='#[attributes.fileName default "manual-upload.csv"]' doc:name="Save File Name"/>
+        <set-variable variableName="rawCatalogText" value="#[payload as String]" doc:name="Preserve Source Text"/>
+
+        <db:insert doc:name="Create Import Audit" doc:id="e6482a7d-0238-4b45-831f-ac20eba98750" config-ref="Database_Config1">
+			<db:sql ><![CDATA[INSERT INTO catalog_import_runs
+(run_id, file_name, file_checksum, extract_type, run_status, started_at)
+VALUES
+(:runId, :fileName, SHA2(:rawText, 256), :extractType, :runStatus, NOW())]]></db:sql>
+			<db:input-parameters ><![CDATA[#[{
+  runId: vars.runId,
+  fileName: vars.catalogFileName,
+  rawText: vars.rawCatalogText,
+  extractType: if (
+  startsWith(upper(vars.catalogFileName as String), "FULL_")
+) "FULL" else "DELTA",
+  runStatus: "PROCESSING"
+}]]]></db:input-parameters>
+		</db:insert>
+		<ee:transform doc:name="Parse Pipe Delimited Catalog">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+var text = (vars.rawCatalogText default "") as String
+var lines = text splitBy /\r?\n/
+var nonBlank = lines filter ((line) -> !isEmpty(trim(line)))
+var dataLines = nonBlank filter ((line) -> lower(trim(line)) != "sku|productname|categorycode|brand|price|currency|taxclass|stockstatus|productstatus|shortdescription|imagepath|updatedat")
+---
+dataLines map ((line) -> do {
+    var c = line splitBy /\|/
+    var priceText = trim(c[4] default "")
+    ---
+    {
+        sku: trim(c[0] default ""),
+        productName: trim(c[1] default ""),
+        categoryCode: trim(c[2] default ""),
+        brand: trim(c[3] default ""),
+        priceText: priceText,
+        price: if (priceText matches /^-?[0-9]+(\.[0-9]+)?$/) priceText as Number else null,
+        currency: upper(trim(c[5] default "")),
+        taxClass: trim(c[6] default ""),
+        stockStatus: upper(trim(c[7] default "")),
+        productStatus: upper(trim(c[8] default "")),
+        shortDescription: trim(c[9] default ""),
+        imagePath: trim(c[10] default ""),
+        updatedAt: trim(c[11] default "")
+    }
+})]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+        <set-variable variableName="parsedCount" value="#[sizeOf(payload)]" doc:name="Count Parsed Rows"/>
+
+        <ee:transform doc:name="Validate and Hash Catalog Records">
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+import dw::Crypto
+import toBase64 from dw::core::Binaries
+output application/java
+
+var allowedStatuses = ["ACTIVE", "INACTIVE", "DRAFT"]
+var allowedStockStatuses = ["IN_STOCK", "OUT_OF_STOCK", "BACKORDER", "LOW_STOCK"]
+
+---
+payload map ((p) -> do {
+    var sku = trim((p.sku default "") as String)
+    var productName = trim((p.productName default "") as String)
+    var categoryCode = trim((p.categoryCode default "") as String)
+    var brand = trim((p.brand default "") as String)
+    var currency = upper(trim((p.currency default "") as String))
+    var taxClass = trim((p.taxClass default "") as String)
+    var stockStatus = upper(trim((p.stockStatus default "") as String))
+    var productStatus = upper(trim((p.productStatus default "") as String))
+    var imagePath = trim((p.imagePath default "") as String)
+    var price = p.price default null
+
+    var validationMessage =
+        if (isEmpty(sku)) "Missing SKU"
+        else if (isEmpty(productName)) "Missing product name"
+        else if (isEmpty(categoryCode)) "Missing category code"
+        else if (isEmpty(brand)) "Missing brand"
+        else if (price == null) "Price must be a positive numeric value"
+        else if ((price as Number) <= 0) "Price must be positive"
+        else if (isEmpty(currency) or not (currency matches /^[A-Z]{3}$/)) "Currency must be a 3-letter code"
+        else if (isEmpty(taxClass)) "Missing tax class"
+        else if (isEmpty(stockStatus) or not (allowedStockStatuses contains stockStatus)) "Unsupported stock status"
+        else if (isEmpty(productStatus) or not (allowedStatuses contains productStatus)) "Unsupported product status"
+        else if (isEmpty(imagePath)) "Missing image path"
+        else if (not (imagePath matches /^\/images\/[A-Za-z0-9._-]+\.(jpg|jpeg|png|webp)$/)) "Malformed image path"
+        else null
+
+    var businessFields = {
+        sku: sku,
+        productName: productName,
+        categoryCode: categoryCode,
+        brand: brand,
+        price: price,
+        currency: currency,
+        taxClass: taxClass,
+        stockStatus: stockStatus,
+        productStatus: productStatus,
+        shortDescription: p.shortDescription default "",
+        imagePath: imagePath
+    }
+
+    var canonicalJson = write(businessFields, "application/json")
+
+    ---
+    p ++ {
+        sku: sku,
+        productName: productName,
+        categoryCode: categoryCode,
+        brand: brand,
+        price: price,
+        currency: currency,
+        taxClass: taxClass,
+        stockStatus: stockStatus,
+        productStatus: productStatus,
+        shortDescription: p.shortDescription default "",
+        imagePath: imagePath,
+        valid: validationMessage == null,
+        validationMessage: if (validationMessage == null) "Valid" else validationMessage,
+        contentHash: if (validationMessage == null)
+                        toBase64(Crypto::hashWith(canonicalJson as Binary, "SHA-256"))
+                     else
+                        null
+    }
+})
+]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+
+        <set-variable variableName="validRecords" value="#[payload filter ((p) -> p.valid)]" doc:name="Keep Valid Records"/>
+        <set-variable variableName="rejectedRecords" value="#[payload filter ((p) -> !p.valid)]" doc:name="Keep Rejected Records"/>
+        <set-variable variableName="rejectedCount" value="#[sizeOf(vars.rejectedRecords)]" doc:name="Count Rejected Records"/>
+        <set-variable variableName="newCount" value="#[0]" doc:name="Initialize New Count"/>
+        <set-variable variableName="changedCount" value="#[0]" doc:name="Initialize Changed Count"/>
+        <set-variable variableName="unchangedCount" value="#[0]" doc:name="Initialize Unchanged Count"/>
+        <logger level="INFO" doc:name="Log Validation Totals" message="#['runId=' ++ vars.runId ++ ', parsed=' ++ (vars.parsedCount as String) ++ ', valid=' ++ (sizeOf(vars.validRecords) as String) ++ ', rejected=' ++ (sizeOf(vars.rejectedRecords) as String)]"/>
+
+        <foreach collection="#[vars.validRecords]" doc:name="Persist Valid Products">
+            <set-variable variableName="currentProduct" value="#[payload]" doc:name="Preserve Current Product"/>
+            <logger level="INFO" doc:name="Logger" doc:id="5c9b4e33-924d-44d3-95e5-ffa810826bf4" message="#['DB lookup starting for SKU=' ++ ((vars.currentProduct.sku default 'UNKNOWN') as String)]"/>
+            <set-variable variableName="existingProduct" value="#[[]]" doc:name="Initialize Existing Product Result"/>
+			<db:select config-ref="Database_Config1" target="existingProduct" doc:name="Find Existing SKU">
+                <db:sql><![CDATA[SELECT sku, content_hash, product_name, category_code, brand, price, currency, tax_class, stock_status, product_status, short_description, image_path FROM products WHERE sku = :sku]]></db:sql>
+                <db:input-parameters><![CDATA[#[{ sku: vars.currentProduct.sku }]]]></db:input-parameters>
+            </db:select>
+            <logger level="INFO" doc:name="Logger" doc:id="ea20ef59-51cf-48a5-8905-f32deda06a50" message="#['DB lookup completed. SKU=' ++ ((vars.currentProduct.sku default 'UNKNOWN') as String) ++ ', matches=' ++ ((sizeOf(vars.existingProduct default []) as String))]"/>
+			<choice doc:name="Classify Product">
+                <when expression="#[isEmpty(vars.existingProduct default [])]">
+                    <db:insert config-ref="Database_Config" doc:name="Insert New Product">
+                        <db:sql><![CDATA[INSERT INTO products (sku, product_name, category_code, brand, price, currency, tax_class, stock_status, product_status, short_description, image_path, content_hash, source_updated_at, last_run_id, review_hold) VALUES (:sku, :product_name, :category_code, :brand, :price, :currency, :tax_class, :stock_status, :product_status, :short_description, :image_path, :content_hash, NULLIF(:source_updated_at, ''), :run_id, false)]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{
+                          sku: vars.currentProduct.sku, product_name: vars.currentProduct.productName,
+                          category_code: vars.currentProduct.categoryCode, brand: vars.currentProduct.brand,
+                          price: vars.currentProduct.price, currency: vars.currentProduct.currency,
+                          tax_class: vars.currentProduct.taxClass, stock_status: vars.currentProduct.stockStatus,
+                          product_status: vars.currentProduct.productStatus, short_description: vars.currentProduct.shortDescription,
+                          image_path: vars.currentProduct.imagePath, content_hash: vars.currentProduct.contentHash,
+                          source_updated_at: vars.currentProduct.updatedAt, run_id: vars.runId
+                        }]]]></db:input-parameters>
+                    </db:insert>
+                    <set-variable variableName="newCount" value="#[vars.newCount + 1]" doc:name="Increment New Count"/>
+                </when>
+                <when expression="#[vars.existingProduct[0].content_hash == vars.currentProduct.contentHash]">
+                    <db:update doc:name="Mark Unchanged Product Seen" doc:id="0ac406de-e183-4b8d-a802-62e5f02d0876" config-ref="Database_Config1">
+						<db:sql ><![CDATA[UPDATE products
+SET last_run_id = :runId
+WHERE sku = :sku]]></db:sql>
+						<db:input-parameters ><![CDATA[#[{
+  runId: vars.runId,
+  sku: vars.currentProduct.sku
+}]]]></db:input-parameters>
+					</db:update>
+					<set-variable variableName="unchangedCount" value="#[vars.unchangedCount + 1]" doc:name="Increment Unchanged Count"/>
+                    <logger level="INFO" doc:name="Skip Unchanged Product" message="#['Unchanged SKU: ' ++ vars.currentProduct.sku]"/>
+                </when>
+                <otherwise>
+                    <set-variable value='#[((vars.existingProduct[0].product_name default "") as String)&#10;        != ((vars.currentProduct.productName default "") as String)&#10;    or&#10;    ((vars.existingProduct[0].price default 0) as Number)&#10;        != ((vars.currentProduct.price default 0) as Number)&#10;    or&#10;    ((vars.existingProduct[0].image_path default "") as String)&#10;        != ((vars.currentProduct.imagePath default "") as String)&#10;    or&#10;    ((vars.existingProduct[0].short_description default "") as String)&#10;        != ((vars.currentProduct.shortDescription default "") as String)&#10;    or&#10;    ((vars.existingProduct[0].product_status default "") as String)&#10;        != ((vars.currentProduct.productStatus default "") as String)]' doc:name="Check Customer Facing Change" doc:id="5992c574-8981-45c9-a415-4606fb9d003a" variableName="customerFacingChanged"/>
+					<set-variable value='#[do {&#10;    var oldPrice = (vars.existingProduct[0].price default 0) as Number&#10;    var newPrice = (vars.currentProduct.price default 0) as Number&#10;    var threshold = p("catalog.price.review.threshold.percent") as Number&#10;    var changePercent =&#10;      if (oldPrice == 0)&#10;        0&#10;      else&#10;        abs((newPrice - oldPrice) / oldPrice * 100)&#10;    ---&#10;    oldPrice &gt; 0 and changePercent &gt;= threshold&#10;  }]' doc:name="Check Price Review Threshold" doc:id="1c9f0fde-e55d-4b10-89f2-f722d968135f" variableName="requiresPriceReview"/>
+					<db:update config-ref="Database_Config" doc:name="Update Changed Product">
+                        <db:sql><![CDATA[UPDATE products SET product_name=:product_name, category_code=:category_code, brand=:brand, price=:price, currency=:currency, tax_class=:tax_class, stock_status=:stock_status, product_status=:product_status, short_description=:short_description, image_path=:image_path, content_hash=:content_hash, source_updated_at=NULLIF(:source_updated_at, ''), last_run_id=:run_id, updated_at=CURRENT_TIMESTAMP WHERE sku=:sku]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{
+                          sku: vars.currentProduct.sku, product_name: vars.currentProduct.productName,
+                          category_code: vars.currentProduct.categoryCode, brand: vars.currentProduct.brand,
+                          price: vars.currentProduct.price, currency: vars.currentProduct.currency,
+                          tax_class: vars.currentProduct.taxClass, stock_status: vars.currentProduct.stockStatus,
+                          product_status: vars.currentProduct.productStatus, short_description: vars.currentProduct.shortDescription,
+                          image_path: vars.currentProduct.imagePath, content_hash: vars.currentProduct.contentHash,
+                          source_updated_at: vars.currentProduct.updatedAt, run_id: vars.runId
+                        }]]]></db:input-parameters>
+                    </db:update>
+					<db:update doc:name="Set Product Review Hold" doc:id="119bb780-c5f6-42a4-a42b-460a80e71a6a" config-ref="Database_Config1">
+						<db:sql ><![CDATA[UPDATE products
+SET review_hold = :reviewHold
+WHERE sku = :sku]]></db:sql>
+						<db:input-parameters ><![CDATA[#[{
+  reviewHold: vars.requiresPriceReview,
+  sku: vars.currentProduct.sku
+}]]]></db:input-parameters>
+					</db:update>
+					<db:insert config-ref="Database_Config" doc:name="Write Change History">
+                        <db:sql><![CDATA[INSERT INTO product_change_history
+(run_id, sku, change_type, field_name, old_value, new_value, customer_facing)
+VALUES
+(:runId, :sku, :changeType, :fieldName, :oldValue, :newValue, :customerFacing)]]></db:sql>
+                        <db:input-parameters><![CDATA[#[{
+  runId: vars.runId,
+  sku: vars.currentProduct.sku,
+  changeType: "CHANGED",
+  fieldName: "content_hash",
+  oldValue: vars.existingProduct[0].content_hash,
+  newValue: vars.currentProduct.contentHash,
+  customerFacing: vars.customerFacingChanged
+}]]]></db:input-parameters>
+                    </db:insert>
+					<try doc:name="Try" doc:id="ccdc4255-fe87-4720-9a8b-48bbe3ce8c4c" >
+						<set-payload value='#[{&#10;  runId: vars.runId,&#10;  paths: [&#10;    "/products/" ++ (vars.currentProduct.sku as String),&#10;    vars.currentProduct.imagePath&#10;  ]&#10;}]' doc:name="Prepare CDN Invalidation Payload" doc:id="1cf4ff44-b1cf-4948-93b6-b89c72498e79" />
+						<choice doc:name="Choice" doc:id="b5911afe-a17f-468f-826e-17b7e337abd2" >
+							<when expression="#[vars.customerFacingChanged == true]">
+								<flow-ref doc:name="Call CDN Invalidation" doc:id="36374ae0-dba8-4f9b-bce9-0646ef69a9ab" name="send-cdn-invalidation" />
+							</when>
+						</choice>
+						<error-handler >
+							<on-error-continue enableNotifications="true" logException="true" doc:name="On Error Continue" doc:id="5551c1ef-9a6b-4904-8e94-0c1fc5601a33" >
+								<logger level="INFO" doc:name="Logger" doc:id="86e47f59-f53a-47d6-a6e2-4a7063d42b91" message="CDN invalidation failed; catalog processing will continue."/>
+							</on-error-continue>
+						</error-handler>
+					</try>
+					<set-variable variableName="changedCount" value="#[vars.changedCount + 1]" doc:name="Increment Changed Count"/>
+                </otherwise>
+            </choice>
+        </foreach>
+
+        <choice doc:name="Choice" doc:id="2a510e1b-e94a-4696-bc56-d06651a58c52" >
+			<when expression='#[startsWith(&#10;    upper(vars.catalogFileName as String),&#10;    "FULL_"&#10;) and sizeOf(vars.rejectedRecords default []) == 0]'>
+				<db:update doc:name="Delist Missing Products" doc:id="9ad4ad41-8e75-4bc4-8ccd-aa5b3433ed89" config-ref="Database_Config1">
+					<db:sql ><![CDATA[UPDATE products
+SET product_status = 'INACTIVE',
+    updated_at = NOW()
+WHERE product_status = 'ACTIVE'
+  AND (
+      last_run_id IS NULL
+      OR last_run_id <> :runId
+  )]]></db:sql>
+					<db:input-parameters ><![CDATA[#[{
+  runId: vars.runId
+}]]]></db:input-parameters>
+				</db:update>
+			</when>
+		</choice>
+		<db:update doc:name="Complete Import Audit" doc:id="eeba26ad-22c1-49bf-bed6-9e8207ad9c8a" config-ref="Database_Config1">
+			<db:sql ><![CDATA[UPDATE catalog_import_runs
+SET parsed_count = :parsedCount,
+    new_count = :newCount,
+    changed_count = :changedCount,
+    unchanged_count = :unchangedCount,
+    rejected_count = :rejectedCount,
+    run_status = 'COMPLETED',
+    completed_at = NOW()
+WHERE run_id = :runId]]></db:sql>
+			<db:input-parameters ><![CDATA[#[{
+  parsedCount: vars.parsedCount,
+  newCount: vars.newCount,
+  changedCount: vars.changedCount,
+  unchangedCount: vars.unchangedCount,
+  rejectedCount: vars.rejectedCount,
+  runId: vars.runId
+}]]]></db:input-parameters>
+		</db:update>
+		<logger level="INFO" doc:name="Catalog Run Summary" message="Catalog run completed"/>
+        <set-payload value="#[{runId: vars.runId, fileName: vars.catalogFileName, parsed: vars.parsedCount, new: vars.newCount, changed: vars.changedCount, unchanged: vars.unchangedCount, rejected: vars.rejectedRecords}]" mimeType="application/java" doc:name="Set Import Summary"/>
+    </sub-flow>
+</mule>
