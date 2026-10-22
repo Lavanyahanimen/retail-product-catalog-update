@@ -1,0 +1,124 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<mule xmlns:db="http://www.mulesoft.org/schema/mule/db"
+      xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+      xmlns="http://www.mulesoft.org/schema/mule/core"
+      xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+      xmlns:http="http://www.mulesoft.org/schema/mule/http" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="
+        http://www.mulesoft.org/schema/mule/core
+        http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+        http://www.mulesoft.org/schema/mule/http
+        http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd">
+
+    <http:request-config
+        name="CDN_HTTP_Request_Config"
+        doc:name="CDN HTTP Request Config"
+        basePath="/api/v2">
+
+        <http:request-connection
+            protocol="HTTPS"
+            host="${cdn.api.host}"
+            port="443"/>
+
+    </http:request-config>
+
+    <http:request-config name="HTTP_Request_configuration" doc:name="HTTP Request configuration" doc:id="b2501712-a805-4474-9016-9849e5c4d7a8" basePath="/api/v2" >
+		<http:request-connection host="localhost" port="8089" />
+	</http:request-config>
+	<http:listener-config name="HTTP_Listener_config12" doc:name="HTTP Listener config" doc:id="4d58b4f4-daa1-4876-832f-ae8ad3a358b0" >
+		<http:listener-connection host="0.0.0.0" port="8089" />
+	</http:listener-config>
+	<sub-flow name="send-cdn-invalidation" doc:id="871fd2d4-1011-4471-8c95-710af61f8b4b">
+
+        <set-variable value="#[{&#10;  runId: payload.runId,&#10;  paths: payload.paths,&#10;  pathCount: sizeOf(payload.paths)&#10;}]" doc:name="Preserve CDN Audit Data" doc:id="a21b42b6-8602-4aab-86f4-652a7d1511b4" variableName="cdnAudit"/>
+		<try doc:name="Try" doc:id="f80e50f9-db5e-4d38-89b4-56819ed080f4" >
+			<until-successful maxRetries="2" doc:name="Retry CDN Request" doc:id="406e8f9f-5ac0-4e46-ab86-f1bf3bb0a817" millisBetweenRetries="1000">
+			<http:request config-ref="HTTP_Request_configuration" method="POST" path="/invalidations" doc:name="Send CDN Invalidation" sendBodyMode="ALWAYS">
+
+            <http:headers><![CDATA[#[output application/java
+---
+{
+    "Authorization": "Bearer " ++ (p("cdn.api.token") default ""),
+    "Content-Type": "application/json",
+    "X-Correlation-Id": (vars.runId default uuid()) as String
+}]]]></http:headers>
+
+            <http:response-validator>
+                <http:success-status-code-validator values="200..299" />
+            </http:response-validator>
+
+        </http:request>
+		</until-successful>
+			<set-variable value='#["ACCEPTED"]' doc:name="Mark CDN Success" doc:id="e6c56e77-14c5-49b5-988c-14fe92d381a5" variableName="cdnProviderStatus"/>
+			<set-variable value="#[attributes.statusCode default 202]" doc:name="" doc:id="92f8f775-9099-4c28-89f8-88765bda3a6c" variableName="cdnHttpStatus"/>
+			<set-variable value="1" doc:name="Mark CDN Attempts" doc:id="39852573-0088-4b43-9e10-72af110979d0" variableName="cdnAttemptCount"/>
+			<error-handler >
+				<on-error-continue enableNotifications="true" logException="true" doc:name="On Error Continue" doc:id="e7064fff-3fdf-437a-9251-91b71140b009" type="ANY">
+					<set-variable value='#["FAILED"]' doc:name="Mark CDN Failure" doc:id="9ce590e0-e250-4362-bd86-b1da0af64958" variableName="cdnProviderStatus"/>
+					<set-variable value="#[if (((error.errorType.namespace default '') as String) == 'HTTP' and ((error.errorType.identifier default '') as String) == 'TOO_MANY_REQUESTS') 429 else ((error.errorMessage.attributes.statusCode default 0) as Number)]" doc:name="Set CDN Error Status" doc:id="55409f61-1f0e-4b97-bf27-35164710ff90" variableName="cdnHttpStatus"/>
+					<set-variable value="#[if (((vars.cdnHttpStatus default 0) as Number) == 429) 429 else 503]" doc:name="Set CDN HTTP Status" doc:id="9ee05a72-4f2b-4984-aba7-ed3019647673" variableName="httpStatus"/>
+					<set-variable value="#[3]" doc:name="Mark CDN Attempts Exhausted" doc:id="441a6d59-cd62-4468-82f2-6c7e8ea6f6a9" variableName="cdnAttemptCount"/>
+				</on-error-continue>
+			</error-handler>
+		</try>
+		<db:insert doc:name="Record CDN Invalidation" doc:id="313daeae-fcf7-4cfc-a51e-3e67a77bf019" config-ref="Database_Config1">
+			<db:sql ><![CDATA[INSERT INTO cdn_invalidations
+(
+    run_id, request_ref, path_count, paths,
+    http_status, provider_status, attempt_count,
+    confirmed, requested_at
+)
+VALUES
+(
+    :runId, :requestRef, :pathCount, :paths,
+    :httpStatus, :providerStatus, :attemptCount,
+    :confirmed, NOW()
+)]]></db:sql>
+			<db:input-parameters ><![CDATA[#[{
+  runId: vars.cdnAudit.runId,
+  requestRef: (vars.cdnAudit.runId as String) ++ "-" ++
+              (vars.cdnAudit.paths[0] as String),
+  pathCount: sizeOf(vars.cdnAudit.paths),
+  paths: write(vars.cdnAudit.paths, "application/json"),
+  httpStatus: (vars.cdnHttpStatus default 0) as Number,
+  providerStatus: (vars.cdnProviderStatus default "FAILED") as String,
+  attemptCount: (vars.cdnAttemptCount default 1) as Number,
+  confirmed: if (
+    upper(trim((vars.cdnProviderStatus default "FAILED") as String)) == "ACCEPTED"
+    and ((vars.cdnHttpStatus default 0) as Number) >= 200
+    and ((vars.cdnHttpStatus default 0) as Number) < 300
+  ) 1 else 0
+}]]]></db:input-parameters>
+		</db:insert>
+		<logger
+            level="INFO"
+            message="#['CDN request completed. runId=' ++ ((vars.runId default 'unknown') as String)]"
+            doc:name="Log CDN Request"/>
+
+    </sub-flow>
+	<flow name="catalog-cdn-systemFlow" doc:id="aa4ba1da-2c80-4a92-a507-ede4c414ee7b" >
+		<http:listener doc:name="Listener" doc:id="65031cfa-3cf8-4f14-9a02-809d0b2282e9" config-ref="HTTP_Listener_config12" path="/api/v2/invalidations" allowedMethods="POST">
+			<http:response statusCode="202" >
+			</http:response>
+		</http:listener>
+		<logger level="INFO" doc:name="Logger" doc:id="f20d0240-e3d9-47ca-bccf-565f5e4652b3" message="Log the received request payload" />
+		<ee:transform doc:name="Transform Message" doc:id="20d7bb9c-794d-40ab-8f09-c9d0e9a02fa6">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+{
+    status: "ACCEPTED",
+    provider: "LOCAL_MOCK"
+}]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+
+</mule>
+
+
+
+
